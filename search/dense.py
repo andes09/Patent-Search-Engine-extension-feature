@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer
 
 from search.data import PatentIndex
@@ -72,7 +73,9 @@ class DenseIndex:
 
 def build_dense_index(index: PatentIndex) -> DenseIndex:
     """Embed all chunks (with caching) and return a DenseIndex."""
-    model = SentenceTransformer(_MODEL_NAME)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[dense] embedding device: {device}")
+    model = SentenceTransformer(_MODEL_NAME, device=device)
 
     cache_file = _cache_path(index.texts)
     if os.path.exists(cache_file):
@@ -97,6 +100,7 @@ def dense_search(
     lo: int = 0,
     hi: int | None = None,
     allowed_pids: np.ndarray | None = None,
+    exclude_chunks: set[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return top-k patent indices and their dense scores.
 
@@ -129,6 +133,13 @@ def dense_search(
     E_sub = dense.E[lo:hi]                         # numpy view, no copy
     raw_scores = E_sub @ q_vec                      # (n_chunks_in_range,)
     weighted = raw_scores * dense.weights[lo:hi]   # apply type discount
+
+    # Mask excluded chunks so they cannot win or become a passage.
+    if exclude_chunks:
+        for ci in exclude_chunks:
+            rel = ci - lo
+            if 0 <= rel < (hi - lo):
+                weighted[rel] = -np.inf
 
     # --- Per-patent max-pool using contiguous ranges -----------------------
     # starts/ends are absolute; convert to relative offsets within [lo, hi).
@@ -194,10 +205,17 @@ def best_chunk_for_patent(
     dense: DenseIndex,
     pid: int,
     q_vec: np.ndarray,
+    *,
+    exclude_chunks: set[int] | None = None,
 ) -> int:
     """Return the chunk index with the highest weighted cosine score for patent *pid*."""
     index = dense.index
     lo, hi = int(index.starts[pid]), int(index.ends[pid])
     raw = dense.E[lo:hi] @ q_vec
     weighted = raw * dense.weights[lo:hi]
+    if exclude_chunks:
+        for ci in exclude_chunks:
+            rel = ci - lo
+            if 0 <= rel < hi - lo:
+                weighted[rel] = -np.inf
     return lo + int(np.argmax(weighted))

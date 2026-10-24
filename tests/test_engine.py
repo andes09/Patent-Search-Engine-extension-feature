@@ -311,3 +311,63 @@ class TestFilterCorrectness:
             pid   = engine._doc_number_index[r.doc_number]
             title = idx.patents[pid].get("title", "") or ""
             assert "wheel" in tokenize(title)
+
+
+# ---------------------------------------------------------------------------
+# Milestone 1 (Part 3): exclude_chunks parameter
+# ---------------------------------------------------------------------------
+
+class TestExcludeChunks:
+    def test_no_change_when_none(self, engine):
+        """exclude_chunks=None must produce identical results to not passing it."""
+        r1 = engine.search("tire tread groove", k=10)
+        r2 = engine.search("tire tread groove", k=10, exclude_chunks=None)
+        assert [r.doc_number for r in r1.results] == [r.doc_number for r in r2.results]
+
+    def test_excluded_chunk_never_in_passage(self, engine):
+        """A excluded chunk id must not appear as any result's passage chunk."""
+        # Pick the abstract chunk (chunk 0) of the first patent.
+        pid0 = 0
+        ci0 = int(engine.index.starts[pid0])  # first chunk of first patent
+        resp = engine.search("tire tread groove", k=20, exclude_chunks={ci0})
+        for r in resp.results:
+            # Recover the chunk id backing this passage via text match
+            rpid = engine._doc_number_index[r.doc_number]
+            lo = int(engine.index.starts[rpid])
+            hi = int(engine.index.ends[rpid])
+            passage_ci = None
+            for ci in range(lo, hi):
+                if engine.index.texts[ci] == r.passage.text:
+                    passage_ci = ci
+                    break
+            assert passage_ci != ci0, \
+                f"Excluded chunk {ci0} appeared as passage for {r.doc_number}"
+
+    def test_patent_with_all_chunks_excluded_dropped(self, engine):
+        """A patent whose every chunk is excluded must not appear in results."""
+        pid0 = 0
+        lo = int(engine.index.starts[pid0])
+        hi = int(engine.index.ends[pid0])
+        all_chunks = set(range(lo, hi))
+        doc0 = engine.index.patents[pid0]["doc_number"]
+        resp = engine.search("tire tread groove", k=30, exclude_chunks=all_chunks)
+        assert all(r.doc_number != doc0 for r in resp.results), \
+            f"Patent {doc0} appeared despite all its chunks being excluded"
+
+    def test_exclude_empty_set_unchanged(self, engine):
+        """An empty exclude set must behave identically to None."""
+        r1 = engine.search("wheel bearing", k=10)
+        r2 = engine.search("wheel bearing", k=10, exclude_chunks=set())
+        assert [r.doc_number for r in r1.results] == [r.doc_number for r in r2.results]
+
+    def test_filter_still_holds_with_exclusions(self, engine):
+        """Hard filters must still apply when exclude_chunks is set."""
+        pid0 = 0
+        ci0 = int(engine.index.starts[pid0])
+        resp = engine.search(
+            "tire tread groove", k=10,
+            class_prefix="B60C",
+            exclude_chunks={ci0},
+        )
+        for r in resp.results:
+            assert r.classification.upper().startswith("B60C")

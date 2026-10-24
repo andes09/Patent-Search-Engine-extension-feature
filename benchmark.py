@@ -12,6 +12,7 @@ import random
 from time import perf_counter
 
 import numpy as np
+import torch
 
 from search.data import build_index, load_patents
 from search.dense import build_dense_index
@@ -126,6 +127,8 @@ def _bench_config(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}\n")
 
     # ── Section 1: index build timing ─────────────────────────────────────
     print("## Index Build Timing\n")

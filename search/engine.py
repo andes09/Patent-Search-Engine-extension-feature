@@ -20,6 +20,7 @@ from search.dense import (
 from search.keyword import (
     KeywordIndex,
     KeywordResult,
+    best_keyword_chunk_for_patent,
     build_keyword_index,
     keyword_search,
     tokenize,
@@ -57,6 +58,25 @@ class SearchResponse:
     results: list[SearchResult]
     suggestions: dict[str, list[tuple[str, int]]]
     timings: dict[str, float]
+
+
+@dataclass
+class Stage1Candidates:
+    """Rich result from stage-1 retrieval, carrying per-candidate chunk data for stage 2.
+
+    ``response`` is the normal SearchResponse (returned directly by search()).
+    ``d_rank`` / ``k_rank`` are the 1-based dense / keyword ranks for all candidates
+    before the top-k cut (used by the blend RRF formula in stage 2).
+    ``dense_chunk`` / ``keyword_chunk`` map each result patent id to its best
+    chunk id under the respective signal; None entries if the signal wasn't active.
+    ``q_vec`` is the normalised query embedding, reused by stage 2 for passage lookup.
+    """
+    response: SearchResponse
+    d_rank: dict[int, int]          # pid → 1-based rank in dense top-n_candidates
+    k_rank: dict[int, int]          # pid → 1-based rank in keyword top-n_candidates
+    dense_chunk: dict[int, int]     # pid → best dense chunk id (exclude_chunks applied)
+    keyword_chunk: dict[int, int]   # pid → best keyword chunk id (exclude_chunks applied)
+    q_vec: np.ndarray               # float32 query embedding
 
 
 # ---------------------------------------------------------------------------
@@ -152,23 +172,50 @@ class SearchEngine:
         keywords: list[str] | None = None,
         k: int = 10,
         plan: str = "auto",
+        exclude_chunks: set[int] | None = None,
     ) -> SearchResponse:
         """Search the patent index.
 
         Parameters
         ----------
-        query        : natural-language or claim query text
-        patent_id    : doc_number of a seed patent (query = title+abstract+claim 1)
-        mode         : "hybrid" | "dense" | "keyword"
-        class_prefix : hard filter — classification must start with this prefix
-        title_has    : hard filter — every word must appear in the title
-        abstract_has : hard filter — every word must appear in the abstract
-        title_exact  : hard filter — exact (normalised) title match
-        keywords     : soft keywords; quoted entries (``"bead seat"``) are phrases
-        k            : number of results to return
-        plan         : "auto" (class via lo/hi, word filter via mask) or
-                       "post" (score full corpus, then filter — benchmark baseline)
+        query          : natural-language or claim query text
+        patent_id      : doc_number of a seed patent (query = title+abstract+claim 1)
+        mode           : "hybrid" | "dense" | "keyword"
+        class_prefix   : hard filter — classification must start with this prefix
+        title_has      : hard filter — every word must appear in the title
+        abstract_has   : hard filter — every word must appear in the abstract
+        title_exact    : hard filter — exact (normalised) title match
+        keywords       : soft keywords; quoted entries (``"bead seat"``) are phrases
+        k              : number of results to return
+        plan           : "auto" (class via lo/hi, word filter via mask) or
+                         "post" (score full corpus, then filter — benchmark baseline)
+        exclude_chunks : chunk ids invisible to both dense and keyword scoring;
+                         patents left with zero chunks are dropped from results
         """
+        return self._search_candidates(
+            query=query, patent_id=patent_id, mode=mode,
+            class_prefix=class_prefix, title_has=title_has,
+            abstract_has=abstract_has, title_exact=title_exact,
+            keywords=keywords, k=k, plan=plan,
+            exclude_chunks=exclude_chunks,
+        ).response
+
+    def _search_candidates(
+        self,
+        query: str | None = None,
+        patent_id: str | None = None,
+        mode: str = "hybrid",
+        class_prefix: str | None = None,
+        title_has: list[str] | None = None,
+        abstract_has: list[str] | None = None,
+        title_exact: str | None = None,
+        keywords: list[str] | None = None,
+        k: int = 10,
+        plan: str = "auto",
+        exclude_chunks: set[int] | None = None,
+    ) -> "Stage1Candidates":
+        """Full stage-1 retrieval; returns the SearchResponse plus per-candidate
+        best chunk ids and rank dicts needed by two_phase_search in stage 2."""
         t0 = perf_counter()
         n_patents = len(self.index.patents)
         n_chunks  = len(self.index.texts)
@@ -206,10 +253,16 @@ class SearchEngine:
             lo_pid, hi_pid = self._class_range(class_prefix.upper())
             if lo_pid >= hi_pid:
                 dt = perf_counter() - t_filter
-                return SearchResponse(
+                empty_resp = SearchResponse(
                     results=[],
                     suggestions={},
                     timings={"filter": dt, "total": perf_counter() - t0, "plan": plan},
+                )
+                return Stage1Candidates(
+                    response=empty_resp,
+                    d_rank={}, k_rank={},
+                    dense_chunk={}, keyword_chunk={},
+                    q_vec=np.zeros(1, dtype=np.float32),
                 )
             lo = int(self.index.starts[lo_pid])
             hi = int(self.index.ends[hi_pid - 1])
@@ -292,6 +345,7 @@ class SearchEngine:
             dense_pids, dense_scores = dense_search(
                 self.dense, query, k=100,
                 lo=s_lo, hi=s_hi, allowed_pids=s_allowed,
+                exclude_chunks=exclude_chunks,
             )
         dt_dense = perf_counter() - t_dense
 
@@ -304,6 +358,7 @@ class SearchEngine:
                 self.kidx, query, k=100,
                 soft_keywords=keywords,
                 lo=s_lo, hi=s_hi, allowed_pids=s_allowed,
+                exclude_chunks=exclude_chunks,
             )
         dt_kw = perf_counter() - t_kw
 
@@ -342,6 +397,9 @@ class SearchEngine:
         sug = kw_result.suggestions     if kw_result else {}
 
         results: list[SearchResult] = []
+        dense_chunk_map: dict[int, int] = {}
+        keyword_chunk_map: dict[int, int] = {}
+
         for pid in top_pids:
             p = self.index.patents[pid]
 
@@ -349,14 +407,25 @@ class SearchEngine:
             in_k = pid in k_rank
             found_by = "both" if (in_d and in_k) else ("semantic" if in_d else "keyword")
 
-            # Best passage by dense similarity (always meaningful regardless of mode)
-            ci = best_chunk_for_patent(self.dense, pid, q_vec)
+            # Best passage by dense similarity; excludes hidden chunks.
+            ci = best_chunk_for_patent(
+                self.dense, pid, q_vec, exclude_chunks=exclude_chunks
+            )
+            dense_chunk_map[pid] = ci
             passage = Passage(
                 type=self.index.chunk_type[ci],
                 ref=int(self.index.chunk_ref[ci]),
                 independent=bool(self.index.chunk_independent[ci]),
                 text=self.index.texts[ci],
             )
+
+            # Best keyword chunk for stage-2 pair deduplication.
+            if kw_result is not None and kw_result.chunk_scores is not None:
+                kci = best_keyword_chunk_for_patent(
+                    self.kidx, pid, kw_result.chunk_scores,
+                    exclude_chunks=exclude_chunks,
+                )
+                keyword_chunk_map[pid] = kci
 
             results.append(SearchResult(
                 doc_number=p["doc_number"],
@@ -382,4 +451,12 @@ class SearchEngine:
             "total":           dt_total,
             "plan":            actual_plan,
         }
-        return SearchResponse(results=results, suggestions=sug, timings=timings)
+        response = SearchResponse(results=results, suggestions=sug, timings=timings)
+        return Stage1Candidates(
+            response=response,
+            d_rank=d_rank,
+            k_rank=k_rank,
+            dense_chunk=dense_chunk_map,
+            keyword_chunk=keyword_chunk_map,
+            q_vec=q_vec,
+        )

@@ -98,6 +98,7 @@ class KeywordResult:
     suggestions: dict[str, list[tuple[str, int]]]  # zero-match: term → [(similar, count)]
     matched_terms: list[str]
     matched_phrases: list[str]
+    chunk_scores: np.ndarray | None = None         # per-chunk BM25 scores; used by stage 2
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +231,7 @@ def keyword_search(
     lo: int = 0,
     hi: int | None = None,
     allowed_pids: np.ndarray | None = None,
+    exclude_chunks: set[int] | None = None,
 ) -> KeywordResult:
     """Return top-k patents by BM25 score.
 
@@ -318,6 +320,12 @@ def keyword_search(
                         sub[rel_i] += _PHRASE_BONUS
             all_scores[lo:hi] = sub
 
+    # Mask excluded chunks so they cannot win or become a passage.
+    if exclude_chunks:
+        for ci in exclude_chunks:
+            if 0 <= ci < len(all_scores):
+                all_scores[ci] = -np.inf
+
     # ---- Per-patent max-pool over [lo, hi) using contiguous layout ------
     rel_starts = np.clip(index.starts - lo, 0, hi - lo)
     rel_ends   = np.clip(index.ends   - lo, 0, hi - lo)
@@ -331,6 +339,7 @@ def keyword_search(
             suggestions=suggestions,
             matched_terms=list(term_weights),
             matched_phrases=[" ".join(ph) for ph in phrases],
+            chunk_scores=all_scores,
         )
 
     chunk_scores_sub = all_scores[lo:hi]
@@ -354,6 +363,7 @@ def keyword_search(
             suggestions=suggestions,
             matched_terms=list(term_weights),
             matched_phrases=[" ".join(ph) for ph in phrases],
+            chunk_scores=all_scores,
         )
 
     k_actual  = min(k, len(positive_scores))
@@ -370,4 +380,28 @@ def keyword_search(
         suggestions=suggestions,
         matched_terms=matched_terms,
         matched_phrases=matched_phrases,
+        chunk_scores=all_scores,
     )
+
+
+def best_keyword_chunk_for_patent(
+    kidx: KeywordIndex,
+    pid: int,
+    chunk_scores: np.ndarray,
+    *,
+    exclude_chunks: set[int] | None = None,
+) -> int:
+    """Return the chunk index with highest BM25 score for patent *pid*.
+
+    *chunk_scores* is the flat per-chunk score array from KeywordResult.chunk_scores.
+    Excluded chunks are masked to -inf before argmax, so they cannot win.
+    """
+    index = kidx.index
+    lo, hi = int(index.starts[pid]), int(index.ends[pid])
+    scores = chunk_scores[lo:hi].copy()
+    if exclude_chunks:
+        for ci in exclude_chunks:
+            rel = ci - lo
+            if 0 <= rel < hi - lo:
+                scores[rel] = -np.inf
+    return lo + int(np.argmax(scores))
